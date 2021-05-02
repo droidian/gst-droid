@@ -2,7 +2,7 @@
  * gst-droid
  *
  * Copyright (C) 2014 Mohammed Sameer <msameer@foolab.org>
- * Copyright (C) 2016 Jolla LTD.
+ * Copyright (C) 2015-2018 Jolla Ltd.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -77,7 +77,12 @@ typedef enum
   PROP_MIN_EXPOSURE_TIME,
   PROP_MAX_EXPOSURE_TIME,
   PROP_NOISE_REDUCTION,
-  PROP_EXPOSURE_MODE
+  PROP_EXPOSURE_MODE,
+
+  /* camerabin interface */
+  PROP_POST_PREVIEW,
+  PROP_PREVIEW_CAPS,
+  PROP_PREVIEW_FILTER
 } GstDroidCamSrcProperties;
 
 void gst_droidcamsrc_photography_register (gpointer g_iface,  gpointer iface_data);
