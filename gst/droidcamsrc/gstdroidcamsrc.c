@@ -454,7 +454,7 @@ gst_droidcamsrc_set_property (GObject * object, guint prop_id,
         new_caps = gst_caps_ref (new_caps);
       }
 
-      if (!gst_caps_is_equal (src->preview_caps, new_caps)) {
+      if (!src->preview_caps || !gst_caps_is_equal (src->preview_caps, new_caps)) {
         gst_caps_replace (&src->preview_caps, new_caps);
 
         if (src->preview_pipeline) {
@@ -1065,12 +1065,15 @@ gst_droidcamsrc_class_init (GstDroidCamSrcClass * klass)
       GST_DEBUG_FUNCPTR (gst_droidcamsrc_change_state);
   gstelement_class->send_event = GST_DEBUG_FUNCPTR (gst_droidcamsrc_send_event);
 
-  g_object_class_install_property (gobject_class, PROP_CAMERA_DEVICE,
-      g_param_spec_int ("camera-device", "Camera device",
-          "Defines which camera device should be used",
-          0,
-          droid_media_camera_get_number_of_cameras (),
-          DEFAULT_CAMERA_DEVICE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  /* Add camera-device property only if cameras have been found */
+  if (droid_media_camera_get_number_of_cameras () > 0) {
+    g_object_class_install_property (gobject_class, PROP_CAMERA_DEVICE,
+        g_param_spec_int ("camera-device", "Camera device",
+            "Defines which camera device should be used",
+            0,
+            droid_media_camera_get_number_of_cameras () - 1,
+            DEFAULT_CAMERA_DEVICE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  }
 
   g_object_class_install_property (gobject_class, PROP_MODE,
       g_param_spec_enum ("mode", "Mode",
@@ -1308,7 +1311,7 @@ out:
     GST_DEBUG_OBJECT (pad, "Pushing SEGMENT");
 
     if (data->adjust_segment) {
-      data->segment.start = GST_BUFFER_TIMESTAMP (buffer);
+      data->segment.start = GST_BUFFER_PTS (buffer);
     }
 
     event = gst_event_new_segment (&data->segment);
@@ -1705,7 +1708,7 @@ gst_droidcamsrc_vfsrc_negotiate (GstDroidCamSrcPad * data)
     gst_droidcamsrc_params_choose_video_framerate (src->dev->params, our_caps);
   }
 
-  if (!gst_pad_set_caps (data->pad, our_caps)) {
+  if (!gst_pad_push_event (data->pad, gst_event_new_caps (our_caps))) {
     GST_ERROR_OBJECT (src, "failed to set caps");
     goto out;
   }
@@ -1865,7 +1868,7 @@ gst_droidcamsrc_imgsrc_negotiate (GstDroidCamSrcPad * data)
   our_caps = gst_droidcamsrc_pick_largest_resolution (src, our_caps);
   gst_droidcamsrc_params_choose_image_framerate (src->dev->params, our_caps);
 
-  if (!gst_pad_set_caps (data->pad, our_caps)) {
+  if (!gst_pad_push_event (data->pad, gst_event_new_caps (our_caps))) {
     GST_ERROR_OBJECT (src, "failed to set caps");
     goto out;
   }
@@ -1937,14 +1940,9 @@ gst_droidcamsrc_vidsrc_negotiate (GstDroidCamSrcPad * data)
   our_caps = gst_caps_make_writable (our_caps);
   our_caps = gst_droidcamsrc_pick_largest_resolution (src, our_caps);
 
-  /* just in case.
-   * TODO: a better way of doing it is to get the current fps preview range and use its
-   * upper bound
-   */
-  gst_structure_fixate_field_nearest_fraction (gst_caps_get_structure (our_caps,
-          0), "framerate", G_MAXINT, 1);
+  gst_droidcamsrc_params_choose_framerate (src->dev->params, our_caps, FALSE, NULL);
 
-  if (!gst_pad_set_caps (data->pad, our_caps)) {
+  if (!gst_pad_push_event (data->pad, gst_event_new_caps (our_caps))) {
     GST_ERROR_OBJECT (src, "failed to set caps");
     goto out;
   }
