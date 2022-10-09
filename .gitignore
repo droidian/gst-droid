@@ -1,2 +1,5 @@
 _build
 /documentation.list
+
+# Added by Droidian
+!.circleci/
