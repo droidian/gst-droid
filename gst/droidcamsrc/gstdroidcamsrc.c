@@ -4,6 +4,7 @@
  * Copyright (C) 2014 Mohammed Sameer
  * Copyright (C) 2015-2021 Jolla Ltd.
  * Copyright (C) 2010 Texas Instruments, Inc
+ * Copyright (C) 2021-2022 Open Mobile Platform LLC.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -95,6 +96,7 @@ static gchar *gst_droidcamsrc_find_picture_resolution (GstDroidCamSrc * src,
 static gboolean gst_droidcamsrc_is_zsl_and_hdr_supported (GstDroidCamSrc * src);
 static GstCaps *gst_droidcamsrc_get_video_caps_locked (GstDroidCamSrc * src);
 static gboolean gst_droidcamsrc_get_hw (GstDroidCamSrc * src);
+static gboolean gst_droidcamsrc_update_jpeg_quality(GstDroidCamSrc * src);
 
 enum
 {
@@ -120,6 +122,10 @@ static guint droidcamsrc_signals[LAST_SIGNAL];
 #define DEFAULT_IMAGE_MODE             GST_DROIDCAMSRC_IMAGE_MODE_NORMAL
 #define DEFAULT_TARGET_BITRATE         12000000
 #define DEFAULT_POST_PREVIEW           FALSE
+/* JPEG quality for photos in %, min 10% max 100% - safe values */
+#define DEFAULT_JPEG_QUALITY           90
+#define DEFAULT_MIN_JPEG_QUALITY       10
+#define DEFAULT_MAX_JPEG_QUALITY       100
 
 static GstDroidCamSrcPad *
 gst_droidcamsrc_create_pad (GstDroidCamSrc * src,
@@ -189,6 +195,7 @@ gst_droidcamsrc_init (GstDroidCamSrc * src)
   src->fps_n = 0;
   src->fps_d = 1;
   src->target_bitrate = DEFAULT_TARGET_BITRATE;
+  src->jpeg_quality = DEFAULT_JPEG_QUALITY;
 
   gst_droidcamsrc_photography_init (src);
 
@@ -333,6 +340,10 @@ gst_droidcamsrc_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_PREVIEW_FILTER:
       if (src->preview_filter)
         g_value_set_object (value, src->preview_filter);
+      break;
+
+    case PROP_JPEG_QUALITY:
+      g_value_set_uint (value, src->jpeg_quality);
       break;
 
     default:
@@ -480,6 +491,11 @@ gst_droidcamsrc_set_property (GObject * object, guint prop_id,
         GST_WARNING_OBJECT (src,
             "Cannot change preview filter, is element in NULL state?");
       }
+      break;
+
+    case PROP_JPEG_QUALITY:
+      src->jpeg_quality = g_value_get_uint(value);
+      gst_droidcamsrc_apply_mode_settings (src, SET_AND_APPLY);
       break;
 
     default:
@@ -683,6 +699,9 @@ gst_droidcamsrc_change_state (GstElement * element, GstStateChange transition)
       /* Now add the needed orientation tag */
       gst_droidcamsrc_add_vfsrc_orientation_tag (src);
 
+      /* Update photos jpeg quality */
+      gst_droidcamsrc_update_jpeg_quality(src);
+
       /* without this the preview pipeline will not post buffer
        * messages on the pipeline */
       gst_element_set_state (src->preview_pipeline->pipeline,
@@ -736,6 +755,17 @@ gst_droidcamsrc_change_state (GstElement * element, GstStateChange transition)
 
   switch (transition) {
     case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
+    /**
+     * Send flush start to make sure the sink will drop its buffers.
+     *
+     * It is required to flush it before calling gst_droidcamsrc_dev_stop()
+     * to avoid deadlock in android::BufferQueueProducer::dequeueBuffer()
+     */
+      g_mutex_lock (&src->vfsrc->lock);
+      GST_INFO_OBJECT (src, "pushing flush start");
+      gst_pad_push_event (src->vfsrc->pad, gst_event_new_flush_start ());
+      g_mutex_unlock (&src->vfsrc->lock);
+
       /* TODO: stop recording if we are recording */
       gst_droidcamsrc_dev_stop (src->dev);
       src->captures = 0;
@@ -746,11 +776,6 @@ gst_droidcamsrc_change_state (GstElement * element, GstStateChange transition)
         src->active_mode = NULL;
       }
 
-      /* Send flush start to make sure the sink will drop its buffers */
-      g_mutex_lock (&src->vfsrc->lock);
-      GST_INFO_OBJECT (src, "pushing flush start");
-      gst_pad_push_event (src->vfsrc->pad, gst_event_new_flush_start ());
-      g_mutex_unlock (&src->vfsrc->lock);
       break;
 
     case GST_STATE_CHANGE_PAUSED_TO_READY:
@@ -1191,6 +1216,12 @@ gst_droidcamsrc_class_init (GstDroidCamSrcClass * klass)
       g_param_spec_variant ("supported-iso-speeds", "Supported ISO speeds",
           "Supported ISO speeds", G_VARIANT_TYPE_VARIANT, NULL,
           G_PARAM_READABLE));
+
+  g_object_class_install_property (gobject_class, PROP_JPEG_QUALITY,
+      g_param_spec_int ("jpeg-quality", "JPEG quality",
+          "Android HAL's jpeg quality", DEFAULT_MIN_JPEG_QUALITY,
+          DEFAULT_MAX_JPEG_QUALITY, DEFAULT_JPEG_QUALITY,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   /* camerabin interface */
   g_object_class_install_property (gobject_class, PROP_POST_PREVIEW,
@@ -1940,7 +1971,7 @@ gst_droidcamsrc_vidsrc_negotiate (GstDroidCamSrcPad * data)
   our_caps = gst_caps_make_writable (our_caps);
   our_caps = gst_droidcamsrc_pick_largest_resolution (src, our_caps);
 
-  gst_droidcamsrc_params_choose_framerate (src->dev->params, our_caps, FALSE, NULL);
+  gst_droidcamsrc_params_choose_framerate (src->dev->params, our_caps, NULL);
 
   if (!gst_pad_push_event (data->pad, gst_event_new_caps (our_caps))) {
     GST_ERROR_OBJECT (src, "failed to set caps");
@@ -2298,6 +2329,9 @@ gst_droidcamsrc_apply_mode_settings (GstDroidCamSrc * src,
   /* video torch */
   gst_droidcamsrc_photography_set_flash_to_droid (src);
 
+  /* jpeg quality */
+  gst_droidcamsrc_update_jpeg_quality (src);
+
   /* face detection quirk */
   gst_droidcamsrc_apply_quirk (src, "face-detection", src->face_detection);
 
@@ -2627,4 +2661,42 @@ gst_droidcamsrc_post_preview (GstDroidCamSrc * src, GstSample * sample)
     GST_DEBUG_OBJECT (src, "Previews not enabled, not posting");
     gst_sample_unref (sample);
   }
+}
+
+static gboolean
+gst_droidcamsrc_update_jpeg_quality(GstDroidCamSrc * src)
+{
+  gboolean ret = FALSE;
+  const gchar* str = NULL;
+  gint jpeg_quality = 0;
+
+  GST_DEBUG_OBJECT (src, "update jpeg quality");
+
+  do {
+    g_rec_mutex_lock (&src->dev_lock);
+
+    if (!src->dev || !src->dev->params)
+      break;
+
+    jpeg_quality =
+      gst_droidcamsrc_params_get_int (src->dev->params, "jpeg-quality");
+
+    /*
+     * Value is not good, keep compatibility with current devices
+     * (-1 - value not present, 0 - value is not correct integer)
+     */
+    if (jpeg_quality <= 0)
+      break;
+
+    str = g_strdup_printf ("%u", src->jpeg_quality);
+    gst_droidcamsrc_params_set_string(src->dev->params, "jpeg-quality", str);
+    g_free(str);
+    ret = TRUE;
+  } while(0);
+
+  g_rec_mutex_unlock (&src->dev_lock);
+
+  GST_INFO_OBJECT (src, "setting jpeg quality to %u was %s", src->jpeg_quality,
+    ret ? "OK" : "FAILED");
+  return ret;
 }
